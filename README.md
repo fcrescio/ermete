@@ -51,11 +51,82 @@ curl -i http://localhost:8080/readyz
 curl -i http://localhost:8080/metrics
 ```
 
+## Guida d'uso (workflow consigliato)
+
+1. **Avvia Ermete** in locale o in container.
+2. **Verifica lo stato** con `/healthz` e `/readyz`.
+3. **Apri una sessione WebRTC** collegandoti a `ws://<host>:8080/v1/ws`.
+4. **Invia i frame periodici** su `POST /v1/frames` (raw o multipart).
+5. **Usa il DataChannel `cmd`** per ping/stato/comandi (`ping`, `server_status`, `say`).
+
+Esempio rapido di check post-avvio:
+
+```bash
+curl -s http://localhost:8080/healthz
+curl -s http://localhost:8080/readyz
+curl -s http://localhost:8080/metrics | head
+```
+
 ## Docker
 
 ```bash
 docker build -t ermete .
 docker run --rm -p 8080:8080 -v "$(pwd)/data:/data" ermete
+```
+
+## Esempio Docker Compose (tailored)
+
+Questo esempio è pensato per un deployment singolo di Ermete con:
+- persistenza locale in `./data`;
+- policy sessione `kick_previous` (utile in sviluppo/mobile);
+- STUN pubblico di base;
+- endpoint esposto su `8080`.
+
+`docker-compose.yml`:
+
+```yaml
+services:
+  ermete:
+    build: .
+    container_name: ermete
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      HTTP_ADDR: ":8080"
+      DATA_DIR: "/data"
+      MAX_UPLOAD_MB: "10"
+      LOG_LEVEL: "info"
+      SESSION_POLICY: "kick_previous"
+      WEBRTC_STUN_URLS: "stun:stun.l.google.com:19302"
+      # Se usi TURN in produzione, decommenta e imposta:
+      # WEBRTC_TURN_URLS: "turn:turn.example.com:3478"
+      # WEBRTC_TURN_USER: "user"
+      # WEBRTC_TURN_PASS: "pass"
+    volumes:
+      - ./data:/data
+```
+
+Avvio:
+
+```bash
+docker compose up -d --build
+```
+
+Check veloci:
+
+```bash
+curl -i http://localhost:8080/healthz
+curl -i http://localhost:8080/readyz
+```
+
+Upload frame di test:
+
+```bash
+curl -X POST http://localhost:8080/v1/frames \
+  -H "Content-Type: image/png" \
+  -H "X-Frame-Id: compose-test-001" \
+  --data-binary @sample.png
 ```
 
 ## Signaling WebSocket
