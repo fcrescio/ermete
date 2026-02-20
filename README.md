@@ -104,7 +104,7 @@ services:
       # WEBRTC_TURN_USER: "user"
       # WEBRTC_TURN_PASS: "pass"
     volumes:
-      - ./data:/data
+      - ./data:/data:Z
 ```
 
 Avvio:
@@ -118,6 +118,25 @@ Check veloci:
 ```bash
 curl -i http://localhost:8080/healthz
 curl -i http://localhost:8080/readyz
+```
+
+### Nota Podman (SELinux/rootless)
+
+Con Podman (specialmente rootless su host con SELinux attivo), il bind mount `./data:/data`
+può fallire con errori come:
+
+`create frames dir: mkdir /data/frames: permission denied`
+
+Per risolvere:
+
+- usa il relabel SELinux sul volume: `./data:/data:Z` (o `:z` se la directory è condivisa tra più container);
+- assicurati che la directory host esista prima dell'avvio: `mkdir -p ./data`.
+
+Esempio run Podman:
+
+```bash
+mkdir -p ./data
+podman run --rm -p 8080:8080 -v "$(pwd)/data:/data:Z" ermete
 ```
 
 Upload frame di test:
