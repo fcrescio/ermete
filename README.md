@@ -33,8 +33,20 @@ Ermete è un server Go **single-session** per Android che combina signaling WebR
 | `WEBRTC_STUN_URLS` | vuoto | CSV STUN URLs |
 | `WEBRTC_TURN_URLS` | vuoto | CSV TURN URLs |
 | `WEBRTC_TURN_USER` / `WEBRTC_TURN_PASS` | vuoto | credenziali TURN |
+| `ERMETE_PSK` | *(obbligatoria)* | pre-shared key per `/v1/frames` e `/v1/ws` |
+| `ERMETE_ALLOW_NO_PSK` | `false` | se `true` consente avvio senza PSK (solo dev/test) |
+| `ERMETE_PSK_HEADER` | `X-Ermete-PSK` | header usato per autenticazione PSK |
+| `ERMETE_PSK_ALLOW_QUERY` | `false` | abilita `?psk=` su WS/HTTP (sconsigliato in prod) |
+| `WS_ALLOWED_ORIGINS` | *(vuoto)* | CSV allowlist origin WS (`scheme://host[:port]`) |
+| `WS_ALLOW_NO_ORIGIN` | `true` | accetta WS senza header `Origin` (client non-browser) |
+| `WS_ALLOW_ANY_ORIGIN` | `false` | bypass allowlist origin (solo dev) |
+| `RATE_LIMIT_MAX_ENTRIES` | `10000` | max entry in-memory del rate limiter IP |
+| `RATE_LIMIT_TTL` | `30m` | TTL inattività entry rate limiter |
+| `IDEMPOTENCY_TTL` | `10m` | retention in-memory chiavi idempotenza |
+| `IDEMPOTENCY_MAX` | `50000` | max entry in-memory idempotenza |
 
 > Deploy consigliato: dietro reverse proxy (Nginx/Traefik) per TLS termination e hardening edge.
+> Anche dietro proxy, lasciare sempre PSK abilitata per ridurre accessi accidentali/abusi banali.
 
 ## Esecuzione locale
 
@@ -98,6 +110,11 @@ services:
       MAX_UPLOAD_MB: "10"
       LOG_LEVEL: "info"
       SESSION_POLICY: "kick_previous"
+      ERMETE_PSK: "change-me-long-random"
+      ERMETE_ALLOW_NO_PSK: "false"
+      ERMETE_PSK_HEADER: "X-Ermete-PSK"
+      WS_ALLOWED_ORIGINS: "https://app.example.com"
+      WS_ALLOW_NO_ORIGIN: "true"
       WEBRTC_STUN_URLS: "stun:stun.l.google.com:19302"
       # Se usi TURN in produzione, decommenta e imposta:
       # WEBRTC_TURN_URLS: "turn:turn.example.com:3478"
@@ -143,6 +160,7 @@ Upload frame di test:
 
 ```bash
 curl -X POST http://localhost:8080/v1/frames \
+  -H "X-Ermete-PSK: $ERMETE_PSK" \
   -H "Content-Type: image/png" \
   -H "X-Frame-Id: compose-test-001" \
   --data-binary @sample.png
@@ -150,7 +168,7 @@ curl -X POST http://localhost:8080/v1/frames \
 
 ## Signaling WebSocket
 
-Endpoint: `GET /v1/ws`
+Endpoint: `GET /v1/ws` (richiede header PSK, es. `X-Ermete-PSK`)
 
 Messaggi supportati:
 
@@ -208,6 +226,7 @@ Esempio raw:
 
 ```bash
 curl -X POST http://localhost:8080/v1/frames \
+  -H "X-Ermete-PSK: $ERMETE_PSK" \
   -H "Content-Type: image/jpeg" \
   -H "X-Frame-Id: frame-123" \
   -H "X-Timestamp: 2026-01-01T10:00:00Z" \
@@ -252,3 +271,27 @@ Copertura minima inclusa:
 - parsing env config
 - upload handler (limite dimensione + naming sicuro)
 - policy sessione `reject/kick`
+
+
+## Security hardening (2026)
+
+- Autenticazione PSK applicata a `POST /v1/frames` e `GET /v1/ws`.
+- Confronto PSK in constant-time (`subtle.ConstantTimeCompare`).
+- WebSocket origin check con allowlist configurabile (`WS_ALLOWED_ORIGINS`).
+- Default WS più sicuro: con allowlist vuota accetta solo connessioni senza `Origin` (tipico S2S/non-browser), rifiuta `Origin` presenti.
+- Limiti memory-bound + cleanup periodico su:
+  - rate limiter IP in-app;
+  - mappa idempotenza frame.
+- Nuove metriche Prometheus:
+  - `ermete_rate_limiter_entries`
+  - `ermete_rate_limiter_evictions_total`
+  - `ermete_idempotency_entries`
+  - `ermete_idempotency_evictions_total`
+
+Esempio WS con `wscat`:
+
+```bash
+wscat -H "X-Ermete-PSK: $ERMETE_PSK" -c ws://localhost:8080/v1/ws
+```
+
+> Nota client Android/sample: inviare sempre l'header PSK sia durante handshake WS sia su upload frame.

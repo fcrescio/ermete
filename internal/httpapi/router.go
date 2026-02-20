@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,7 +40,7 @@ type API struct {
 }
 
 func NewRouter(cfg config.Config, logger *zap.Logger, metrics *observability.Metrics, store *storage.FrameStore, sessions *session.Manager, webrtc *wrtc.Service) http.Handler {
-	a := &API{cfg: cfg, logger: logger, metrics: metrics, store: store, sessions: sessions, webrtc: webrtc, started: time.Now().UTC(), limits: NewLimiter()}
+	a := &API{cfg: cfg, logger: logger, metrics: metrics, store: store, sessions: sessions, webrtc: webrtc, started: time.Now().UTC(), limits: NewLimiter(cfg.RateLimitTTL, cfg.RateLimitMaxEntries, metrics, logger)}
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID, chimw.RealIP, chimw.Recoverer, a.requestLogger)
 	if len(cfg.CORSAllowedOrigins) > 0 {
@@ -54,11 +55,11 @@ func NewRouter(cfg config.Config, logger *zap.Logger, metrics *observability.Met
 	r.Handle("/metrics", promhttp.Handler())
 
 	r.Group(func(r chi.Router) {
-		r.Use(a.rateLimitMiddleware(cfg.UploadRatePerSec, cfg.UploadRateBurst))
+		r.Use(a.rateLimitMiddleware(cfg.UploadRatePerSec, cfg.UploadRateBurst), a.requirePSK)
 		r.Post("/v1/frames", a.handleFrameUpload)
 	})
 	r.Group(func(r chi.Router) {
-		r.Use(a.rateLimitMiddleware(cfg.WSRatePerSec, cfg.WSRateBurst))
+		r.Use(a.rateLimitMiddleware(cfg.WSRatePerSec, cfg.WSRateBurst), a.requirePSK)
 		r.Get("/v1/ws", a.handleWS)
 	})
 	return r
@@ -74,7 +75,30 @@ func (a *API) handleReady(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *API) handleWS(w http.ResponseWriter, r *http.Request) {
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool {
+		origin := normalizeOrigin(r.Header.Get("Origin"))
+		if origin == "" {
+			return a.cfg.WSAllowNoOrigin
+		}
+		if a.cfg.WSAllowAnyOrigin {
+			return true
+		}
+		if len(a.cfg.WSAllowedOrigins) == 0 {
+			return false
+		}
+		for _, allowed := range a.cfg.WSAllowedOrigins {
+			if origin == allowed {
+				return true
+			}
+		}
+		return false
+	}}
+	if !upgrader.CheckOrigin(r) {
+		a.metrics.WSRejectTotal.Inc()
+		a.logger.Warn("websocket origin rejected", zap.String("ip", clientIP(r)), zap.String("path", r.URL.Path), zap.String("origin", normalizeOrigin(r.Header.Get("Origin"))))
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden origin"})
+		return
+	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		http.Error(w, "websocket upgrade failed", http.StatusBadRequest)
@@ -100,7 +124,11 @@ func (a *API) handleFrameUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		a.metrics.FrameUploadErrors.Inc()
-		http.Error(w, fmt.Sprintf("invalid payload: %v", err), http.StatusBadRequest)
+		if strings.Contains(strings.ToLower(err.Error()), "too large") {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "payload too large"})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("invalid payload: %v", err)})
 		return
 	}
 
@@ -116,6 +144,26 @@ func (a *API) handleFrameUpload(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]any{"status": "ok", "duplicate": meta.Duplicate, "frame": meta, "request_id": chimw.GetReqID(ctx)}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *API) requirePSK(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		provided := r.Header.Get(a.cfg.PSKHeader)
+		if provided == "" && a.cfg.PSKAllowQuery {
+			provided = r.URL.Query().Get("psk")
+		}
+		if provided == "" {
+			a.logger.Warn("auth rejected", zap.String("ip", clientIP(r)), zap.String("path", r.URL.Path), zap.String("reason", "missing psk"))
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(a.cfg.PSK)) != 1 {
+			a.logger.Warn("auth rejected", zap.String("ip", clientIP(r)), zap.String("path", r.URL.Path), zap.String("reason", "invalid psk"))
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func readMultipartPayload(r *http.Request, maxBytes int64) ([]byte, string, error) {
@@ -156,19 +204,39 @@ func (a *API) requestLogger(next http.Handler) http.Handler {
 	})
 }
 
-type Limiter struct {
-	mu       sync.Mutex
-	limiters map[string]*rate.Limiter
+type limiterEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
 }
 
-func NewLimiter() *Limiter { return &Limiter{limiters: map[string]*rate.Limiter{}} }
+type Limiter struct {
+	mu         sync.Mutex
+	limiters   map[string]*limiterEntry
+	ttl        time.Duration
+	maxEntries int
+	metrics    *observability.Metrics
+	logger     *zap.Logger
+}
+
+func NewLimiter(ttl time.Duration, maxEntries int, metrics *observability.Metrics, logger *zap.Logger) *Limiter {
+	if ttl <= 0 {
+		ttl = 30 * time.Minute
+	}
+	if maxEntries <= 0 {
+		maxEntries = 10000
+	}
+	l := &Limiter{limiters: map[string]*limiterEntry{}, ttl: ttl, maxEntries: maxEntries, metrics: metrics, logger: logger}
+	l.updateMetricsLocked()
+	go l.cleanupLoop()
+	return l
+}
 
 func (a *API) rateLimitMiddleware(rps float64, burst int) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ip := clientIP(r)
 			if !a.limits.allow(ip, rps, burst) {
-				http.Error(w, "rate limited", http.StatusTooManyRequests)
+				writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limited"})
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -177,12 +245,63 @@ func (a *API) rateLimitMiddleware(rps float64, burst int) func(http.Handler) htt
 }
 
 func (l *Limiter) allow(ip string, rps float64, burst int) bool {
+	now := time.Now().UTC()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if _, ok := l.limiters[ip]; !ok {
-		l.limiters[ip] = rate.NewLimiter(rate.Limit(rps), burst)
+	entry, ok := l.limiters[ip]
+	if !ok {
+		if len(l.limiters) >= l.maxEntries {
+			if l.metrics != nil {
+				l.metrics.RateLimiterEvictionsTotal.Inc()
+			}
+			if l.logger != nil {
+				l.logger.Warn("rate limiter map full, rejecting new IP", zap.String("ip", ip), zap.Int("entries", len(l.limiters)))
+			}
+			l.updateMetricsLocked()
+			return false
+		}
+		entry = &limiterEntry{limiter: rate.NewLimiter(rate.Limit(rps), burst), lastSeen: now}
+		l.limiters[ip] = entry
+	} else {
+		entry.lastSeen = now
 	}
-	return l.limiters[ip].Allow()
+	entry.lastSeen = now
+	l.updateMetricsLocked()
+	return entry.limiter.Allow()
+}
+
+func (l *Limiter) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		l.cleanup(time.Now().UTC())
+	}
+}
+
+func (l *Limiter) cleanup(now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for ip, entry := range l.limiters {
+		if now.Sub(entry.lastSeen) > l.ttl {
+			delete(l.limiters, ip)
+			if l.metrics != nil {
+				l.metrics.RateLimiterEvictionsTotal.Inc()
+			}
+		}
+	}
+	l.updateMetricsLocked()
+}
+
+func (l *Limiter) updateMetricsLocked() {
+	if l.metrics != nil {
+		l.metrics.RateLimiterEntries.Set(float64(len(l.limiters)))
+	}
+}
+
+func normalizeOrigin(origin string) string {
+	origin = strings.TrimSpace(origin)
+	origin = strings.TrimSuffix(origin, "/")
+	return origin
 }
 
 func clientIP(r *http.Request) string {
