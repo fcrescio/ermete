@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"ermete/internal/observability"
 )
 
 var safeToken = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
@@ -28,21 +31,70 @@ type FrameMeta struct {
 	Duplicate      bool      `json:"duplicate"`
 }
 
-type FrameStore struct {
-	root          string
-	framesDir     string
-	mu            sync.Mutex
-	byIdempotency map[string]FrameMeta
-	last          FrameMeta
-	count         uint64
+type idemEntry struct {
+	frameMeta FrameMeta
+	seenAt    time.Time
+	elem      *list.Element
 }
 
-func NewFrameStore(dataDir string) (*FrameStore, error) {
+type FrameStore struct {
+	root      string
+	framesDir string
+	mu        sync.Mutex
+
+	byIdempotency map[string]*idemEntry
+	idemOrder     *list.List
+	idemTTL       time.Duration
+	idemMax       int
+
+	last  FrameMeta
+	count uint64
+
+	metrics *observability.Metrics
+}
+
+func NewFrameStore(dataDir string, idemTTL time.Duration, idemMax int, metrics *observability.Metrics) (*FrameStore, error) {
+	if idemTTL <= 0 {
+		idemTTL = 10 * time.Minute
+	}
+	if idemMax <= 0 {
+		idemMax = 50000
+	}
 	framesDir := filepath.Join(dataDir, "frames")
 	if err := os.MkdirAll(framesDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create frames dir: %w", err)
 	}
-	return &FrameStore{root: dataDir, framesDir: framesDir, byIdempotency: map[string]FrameMeta{}}, nil
+	s := &FrameStore{
+		root:          dataDir,
+		framesDir:     framesDir,
+		byIdempotency: map[string]*idemEntry{},
+		idemOrder:     list.New(),
+		idemTTL:       idemTTL,
+		idemMax:       idemMax,
+		metrics:       metrics,
+	}
+	s.updateMetrics()
+	go s.cleanupLoop()
+	return s, nil
+}
+
+func (s *FrameStore) cleanupLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.cleanupExpired(time.Now().UTC())
+	}
+}
+
+func (s *FrameStore) cleanupExpired(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, entry := range s.byIdempotency {
+		if now.Sub(entry.seenAt) > s.idemTTL {
+			s.removeIdemEntryLocked(k)
+		}
+	}
+	s.updateMetricsLocked()
 }
 
 func (s *FrameStore) IsReady() bool {
@@ -59,13 +111,18 @@ func (s *FrameStore) SaveFrame(frameID, timestamp, idem, contentType string, pay
 		timestamp = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 
+	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if idem != "" {
-		if existing, ok := s.byIdempotency[idem]; ok {
-			existing.Duplicate = true
-			return existing, nil
+		if existing, ok := s.byIdempotency[idem]; ok && now.Sub(existing.seenAt) <= s.idemTTL {
+			meta := existing.frameMeta
+			meta.Duplicate = true
+			return meta, nil
+		}
+		if existing, ok := s.byIdempotency[idem]; ok && now.Sub(existing.seenAt) > s.idemTTL {
+			s.removeIdemEntryLocked(idem)
 		}
 	}
 
@@ -85,20 +142,70 @@ func (s *FrameStore) SaveFrame(frameID, timestamp, idem, contentType string, pay
 		Size:           int64(len(payload)),
 		ContentType:    contentType,
 		SHA256:         hex.EncodeToString(sum[:]),
-		ReceivedAt:     time.Now().UTC(),
+		ReceivedAt:     now,
 	}
 	s.last = meta
 	s.count++
 	if idem != "" {
-		s.byIdempotency[idem] = meta
+		s.addIdemEntryLocked(idem, meta, now)
 	}
+	s.updateMetricsLocked()
 	return meta, nil
+}
+
+func (s *FrameStore) addIdemEntryLocked(key string, meta FrameMeta, now time.Time) {
+	elem := s.idemOrder.PushBack(key)
+	s.byIdempotency[key] = &idemEntry{frameMeta: meta, seenAt: now, elem: elem}
+	for len(s.byIdempotency) > s.idemMax {
+		front := s.idemOrder.Front()
+		if front == nil {
+			break
+		}
+		oldKey, _ := front.Value.(string)
+		s.removeIdemEntryLocked(oldKey)
+		if s.metrics != nil {
+			s.metrics.IdempotencyEvictionsTotal.Inc()
+		}
+	}
+}
+
+func (s *FrameStore) removeIdemEntryLocked(key string) {
+	entry, ok := s.byIdempotency[key]
+	if !ok {
+		return
+	}
+	if entry.elem != nil {
+		s.idemOrder.Remove(entry.elem)
+	}
+	delete(s.byIdempotency, key)
 }
 
 func (s *FrameStore) LastMeta() (FrameMeta, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.last, s.count
+}
+
+func (s *FrameStore) IdempotencySize() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.byIdempotency)
+}
+
+func (s *FrameStore) RunCleanup(now time.Time) {
+	s.cleanupExpired(now)
+}
+
+func (s *FrameStore) updateMetrics() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateMetricsLocked()
+}
+
+func (s *FrameStore) updateMetricsLocked() {
+	if s.metrics != nil {
+		s.metrics.IdempotencyEntries.Set(float64(len(s.byIdempotency)))
+	}
 }
 
 func sanitizeToken(in string) string {

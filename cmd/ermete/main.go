@@ -31,12 +31,12 @@ func main() {
 	}
 	defer logger.Sync()
 
-	store, err := storage.NewFrameStore(cfg.DataDir)
+	metrics := observability.NewMetrics(prometheus.DefaultRegisterer)
+	store, err := storage.NewFrameStore(cfg.DataDir, cfg.IdempotencyTTL, cfg.IdempotencyMax, metrics)
 	if err != nil {
 		logger.Fatal("failed to init storage", zap.Error(err))
 	}
 	sessions := session.NewManager(cfg.SessionPolicy)
-	metrics := observability.NewMetrics(prometheus.DefaultRegisterer)
 	webrtcSvc, err := wrtc.NewService(cfg, logger, metrics, sessions, store)
 	if err != nil {
 		logger.Fatal("failed to init webrtc", zap.Error(err))
