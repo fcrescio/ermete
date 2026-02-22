@@ -180,6 +180,18 @@ func (s *FrameStore) removeIdemEntryLocked(key string) {
 	delete(s.byIdempotency, key)
 }
 
+func (s *FrameStore) FramePath(name string) (string, error) {
+	clean := sanitizeToken(name)
+	if clean == "" || clean != name {
+		return "", fmt.Errorf("invalid file name")
+	}
+	fullPath := filepath.Join(s.framesDir, clean)
+	if _, err := os.Stat(fullPath); err != nil {
+		return "", err
+	}
+	return fullPath, nil
+}
+
 func (s *FrameStore) LastMeta() (FrameMeta, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
