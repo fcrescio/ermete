@@ -199,9 +199,6 @@ func (s *Service) initPeer(ps *PeerSession) error {
 			}
 			s.metrics.WebRTCPacketsIn.Inc()
 			s.sessions.Touch()
-			if err := ps.outTrack.WriteRTP(pkt); err == nil {
-				s.metrics.WebRTCPacketsOut.Inc()
-			}
 			s.forwardAudio(ps, pkt)
 		}
 	})
@@ -400,7 +397,7 @@ func (s *Service) handleCommand(ps *PeerSession, msg pion.DataChannelMessage) {
 		b, _ := json.Marshal(payload)
 		_ = ps.sendCmd(CommandEnvelope{Type: "server_status", Text: string(b)})
 	case "say":
-		_ = ps.sendCmd(CommandEnvelope{Type: "say", Text: "audio loopback active"})
+		_ = ps.sendCmd(CommandEnvelope{Type: "say", Text: "audio forwarding active"})
 	default:
 		_ = ps.sendCmd(CommandEnvelope{Type: "error", Text: "unknown command"})
 	}
