@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +58,7 @@ func NewRouter(cfg config.Config, logger *zap.Logger, metrics *observability.Met
 	r.Group(func(r chi.Router) {
 		r.Use(a.rateLimitMiddleware(cfg.UploadRatePerSec, cfg.UploadRateBurst), a.requirePSK)
 		r.Post("/v1/frames", a.handleFrameUpload)
+		r.Get("/v1/frames/file/{file}", a.handleFrameGet)
 	})
 	r.Group(func(r chi.Router) {
 		r.Use(a.rateLimitMiddleware(cfg.WSRatePerSec, cfg.WSRateBurst), a.requirePSK)
@@ -104,7 +106,15 @@ func (a *API) handleWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "websocket upgrade failed", http.StatusBadRequest)
 		return
 	}
-	a.webrtc.HandleWS(r.Context(), conn)
+	role := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("role")))
+	if role == "" {
+		role = "client"
+	}
+	if role != "client" && role != "consumer" {
+		_ = conn.Close()
+		return
+	}
+	a.webrtc.HandleWS(r.Context(), conn, role)
 }
 
 func (a *API) handleFrameUpload(w http.ResponseWriter, r *http.Request) {
@@ -141,9 +151,35 @@ func (a *API) handleFrameUpload(w http.ResponseWriter, r *http.Request) {
 	a.metrics.FramesUploadedTotal.Inc()
 	a.metrics.FrameUploadBytesTotal.Add(float64(len(payload)))
 	a.sessions.Touch()
+	a.webrtc.NotifyFrameAvailable(meta, publicBaseURL(r))
 
 	resp := map[string]any{"status": "ok", "duplicate": meta.Duplicate, "frame": meta, "request_id": chimw.GetReqID(ctx)}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *API) handleFrameGet(w http.ResponseWriter, r *http.Request) {
+	file := filepath.Base(chi.URLParam(r, "file"))
+	path, err := a.store.FramePath(file)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, path)
+}
+
+func publicBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
+		scheme = forwarded
+	}
+	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = r.Host
+	}
+	return scheme + "://" + host
 }
 
 func (a *API) requirePSK(next http.Handler) http.Handler {

@@ -4,7 +4,9 @@ Ermete è un server Go **single-session** per Android che combina signaling WebR
 
 ## Caratteristiche principali
 
-- `GET /v1/ws`: signaling WebRTC con `offer/answer/candidate/bye` JSON.
+- `GET /v1/ws`: signaling WebRTC con ruoli `client` (default) e `consumer` (`?role=consumer`).
+  - `client`: invia `offer`, riceve `answer`;
+  - `consumer`: riceve `offer`, invia `answer`.
 - Audio WebRTC:
   - ingresso dal client su track Opus;
   - uscita server->client su track Opus locale;
@@ -12,7 +14,8 @@ Ermete è un server Go **single-session** per Android che combina signaling WebR
 - DataChannel `cmd`:
   - envelope JSON `{type,text,bin}`;
   - `ping`/`pong`, `server_status`, `say`.
-- `POST /v1/frames` per JPEG/PNG raw o multipart con dedup/idempotenza.
+- `POST /v1/frames` per JPEG/PNG raw o multipart con dedup/idempotenza e notifica realtime ai consumer (`frame_available`).
+- `GET /v1/frames/file/{file}` protetto PSK per download frame salvati.
 - Politica sessione configurabile:
   - `reject_second` (default): secondo client rifiutato;
   - `kick_previous`: il nuovo client sostituisce il precedente.
@@ -168,7 +171,11 @@ curl -X POST http://localhost:8080/v1/frames \
 
 ## Signaling WebSocket
 
-Endpoint: `GET /v1/ws` (richiede header PSK, es. `X-Ermete-PSK`)
+Endpoint: `GET /v1/ws` (richiede header PSK, es. `X-Ermete-PSK`).
+
+Ruolo peer via query string:
+- `ws://.../v1/ws` oppure `?role=client`: peer Android/client principale.
+- `ws://.../v1/ws?role=consumer`: peer consumer secondario (offer iniziale inviata dal server).
 
 Messaggi supportati:
 
@@ -210,6 +217,13 @@ Se arriva payload binario non-string, il server risponde con `pong` e `bin` base
 ## Upload frame
 
 Endpoint: `POST /v1/frames`
+
+
+Evento verso consumer quando arriva un frame:
+
+```json
+{"type":"frame_available","frame_id":"...","file_name":"...","download_url":"http://<host>/v1/frames/file/<file_name>"}
+```
 
 Header opzionali:
 

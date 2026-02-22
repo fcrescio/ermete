@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,14 +36,17 @@ type CommandEnvelope struct {
 }
 
 type Service struct {
-	cfg      config.Config
-	logger   *zap.Logger
-	metrics  *observability.Metrics
-	sessions *session.Manager
-	store    *storage.FrameStore
-	api      *pion.API
-	upgrader websocket.Upgrader
-	started  time.Time
+	cfg       config.Config
+	logger    *zap.Logger
+	metrics   *observability.Metrics
+	sessions  *session.Manager
+	store     *storage.FrameStore
+	api       *pion.API
+	upgrader  websocket.Upgrader
+	started   time.Time
+	mu        sync.RWMutex
+	client    *PeerSession
+	consumers map[string]*PeerSession
 }
 
 func NewService(cfg config.Config, logger *zap.Logger, metrics *observability.Metrics, sessions *session.Manager, store *storage.FrameStore) (*Service, error) {
@@ -54,19 +58,21 @@ func NewService(cfg config.Config, logger *zap.Logger, metrics *observability.Me
 	se.SetIncludeLoopbackCandidate(true)
 	api := pion.NewAPI(pion.WithMediaEngine(m), pion.WithSettingEngine(se))
 	return &Service{
-		cfg:      cfg,
-		logger:   logger,
-		metrics:  metrics,
-		sessions: sessions,
-		store:    store,
-		api:      api,
-		upgrader: websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
-		started:  time.Now().UTC(),
+		cfg:       cfg,
+		logger:    logger,
+		metrics:   metrics,
+		sessions:  sessions,
+		store:     store,
+		api:       api,
+		upgrader:  websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
+		started:   time.Now().UTC(),
+		consumers: map[string]*PeerSession{},
 	}, nil
 }
 
 type PeerSession struct {
 	id         string
+	role       string
 	conn       *websocket.Conn
 	pc         *pion.PeerConnection
 	outTrack   *pion.TrackLocalStaticRTP
@@ -93,15 +99,15 @@ func (p *PeerSession) Close(reason string) {
 		_ = p.pc.Close()
 	}
 	_ = p.conn.Close()
-	p.svc.sessions.Release(p.id)
+	p.svc.onPeerClosed(p)
 }
 
-func (s *Service) HandleWS(ctx context.Context, wsc *websocket.Conn) {
+func (s *Service) HandleWS(ctx context.Context, wsc *websocket.Conn, role string) {
 	s.metrics.WSConnectionsTotal.Inc()
-	peer := &PeerSession{id: fmt.Sprintf("sess-%d", time.Now().UnixNano()), conn: wsc, logger: s.logger, svc: s}
-	if err := s.sessions.Acquire(peer); err != nil {
+	peer := &PeerSession{id: fmt.Sprintf("sess-%d", time.Now().UnixNano()), role: role, conn: wsc, logger: s.logger, svc: s}
+	if err := s.registerPeer(peer); err != nil {
 		s.metrics.WSRejectTotal.Inc()
-		_ = writeJSON(wsc, SignalMessage{Type: "error", Message: "session already active"})
+		_ = writeJSON(wsc, SignalMessage{Type: "error", Message: err.Error()})
 		_ = wsc.Close()
 		return
 	}
@@ -110,6 +116,12 @@ func (s *Service) HandleWS(ctx context.Context, wsc *websocket.Conn) {
 	if err := s.initPeer(peer); err != nil {
 		peer.logger.Error("init peer failed", zap.Error(err))
 		return
+	}
+	if role == "consumer" {
+		if err := s.sendOffer(peer); err != nil {
+			peer.logger.Error("send offer to consumer failed", zap.Error(err))
+			return
+		}
 	}
 
 	for {
@@ -185,6 +197,7 @@ func (s *Service) initPeer(ps *PeerSession) error {
 			if err := ps.outTrack.WriteRTP(pkt); err == nil {
 				s.metrics.WebRTCPacketsOut.Inc()
 			}
+			s.forwardAudio(ps, pkt)
 		}
 	})
 	pc.OnDataChannel(func(dc *pion.DataChannel) {
@@ -206,6 +219,9 @@ func (s *Service) initPeer(ps *PeerSession) error {
 func (s *Service) handleSignal(ps *PeerSession, msg SignalMessage) error {
 	switch msg.Type {
 	case "offer":
+		if ps.role == "consumer" {
+			return errors.New("unexpected offer for consumer")
+		}
 		if msg.SDP == "" {
 			return errors.New("missing offer sdp")
 		}
@@ -221,6 +237,15 @@ func (s *Service) handleSignal(ps *PeerSession, msg SignalMessage) error {
 			return err
 		}
 		return ps.sendSignal(SignalMessage{Type: "answer", SDP: answer.SDP})
+	case "answer":
+		if ps.role != "consumer" {
+			return errors.New("unexpected answer")
+		}
+		if msg.SDP == "" {
+			return errors.New("missing answer sdp")
+		}
+		answer := pion.SessionDescription{Type: pion.SDPTypeAnswer, SDP: msg.SDP}
+		return ps.pc.SetRemoteDescription(answer)
 	case "candidate":
 		if msg.Candidate == nil {
 			return errors.New("missing candidate")
@@ -231,6 +256,91 @@ func (s *Service) handleSignal(ps *PeerSession, msg SignalMessage) error {
 		return nil
 	default:
 		return fmt.Errorf("unknown signal type: %s", msg.Type)
+	}
+}
+
+func (s *Service) registerPeer(ps *PeerSession) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ps.role == "consumer" {
+		s.consumers[ps.id] = ps
+		return nil
+	}
+	if err := s.sessions.Acquire(ps); err != nil {
+		return errors.New("session already active")
+	}
+	s.client = ps
+	return nil
+}
+
+func (s *Service) onPeerClosed(ps *PeerSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ps.role == "consumer" {
+		delete(s.consumers, ps.id)
+		return
+	}
+	if s.client != nil && s.client.id == ps.id {
+		s.client = nil
+	}
+	s.sessions.Release(ps.id)
+}
+
+func (s *Service) sendOffer(ps *PeerSession) error {
+	offer, err := ps.pc.CreateOffer(nil)
+	if err != nil {
+		return err
+	}
+	if err := ps.pc.SetLocalDescription(offer); err != nil {
+		return err
+	}
+	return ps.sendSignal(SignalMessage{Type: "offer", SDP: offer.SDP})
+}
+
+func (s *Service) forwardAudio(src *PeerSession, pkt *rtp.Packet) {
+	cp := CloneRTP(pkt)
+	s.mu.RLock()
+	client := s.client
+	consumers := make([]*PeerSession, 0, len(s.consumers))
+	for _, c := range s.consumers {
+		consumers = append(consumers, c)
+	}
+	s.mu.RUnlock()
+
+	if src.role == "consumer" {
+		if client != nil && client.outTrack != nil {
+			if err := client.outTrack.WriteRTP(CloneRTP(cp)); err == nil {
+				s.metrics.WebRTCPacketsOut.Inc()
+			}
+		}
+		return
+	}
+	for _, c := range consumers {
+		if c != nil && c.outTrack != nil {
+			if err := c.outTrack.WriteRTP(CloneRTP(cp)); err == nil {
+				s.metrics.WebRTCPacketsOut.Inc()
+			}
+		}
+	}
+}
+
+func (s *Service) NotifyFrameAvailable(meta storage.FrameMeta, publicBaseURL string) {
+	payload := map[string]any{
+		"type":         "frame_available",
+		"frame_id":     meta.FrameID,
+		"file_name":    meta.FileName,
+		"download_url": strings.TrimRight(publicBaseURL, "/") + "/v1/frames/file/" + meta.FileName,
+	}
+	s.mu.RLock()
+	consumers := make([]*PeerSession, 0, len(s.consumers))
+	for _, c := range s.consumers {
+		consumers = append(consumers, c)
+	}
+	s.mu.RUnlock()
+	for _, c := range consumers {
+		if c != nil {
+			_ = writeJSON(c.conn, payload)
+		}
 	}
 }
 
