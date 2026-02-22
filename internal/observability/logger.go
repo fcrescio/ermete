@@ -17,7 +17,8 @@ func NewLogger(level string) (*zap.Logger, error) {
 }
 
 func parseLevel(level string) zapcore.Level {
-	switch strings.ToLower(level) {
+	normalized := strings.ToLower(strings.Trim(strings.TrimSpace(level), "\"'"))
+	switch normalized {
 	case "debug":
 		return zap.DebugLevel
 	case "warn":

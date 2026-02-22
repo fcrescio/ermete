@@ -49,6 +49,11 @@ type Service struct {
 	consumers map[string]*PeerSession
 }
 
+type ConnectionSnapshot struct {
+	ClientConnected bool
+	ConsumerCount   int
+}
+
 func NewService(cfg config.Config, logger *zap.Logger, metrics *observability.Metrics, sessions *session.Manager, store *storage.FrameStore) (*Service, error) {
 	m := &pion.MediaEngine{}
 	if err := m.RegisterCodec(pion.RTPCodecParameters{RTPCodecCapability: pion.RTPCodecCapability{MimeType: pion.MimeTypeOpus, ClockRate: 48000, Channels: 2}, PayloadType: 111}, pion.RTPCodecTypeAudio); err != nil {
@@ -284,6 +289,37 @@ func (s *Service) onPeerClosed(ps *PeerSession) {
 		s.client = nil
 	}
 	s.sessions.Release(ps.id)
+}
+
+func (s *Service) ConnectionSnapshot() ConnectionSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return ConnectionSnapshot{
+		ClientConnected: s.client != nil,
+		ConsumerCount:   len(s.consumers),
+	}
+}
+
+func (s *Service) StartConnectionLogging(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				snap := s.ConnectionSnapshot()
+				s.logger.Info("webrtc connection status",
+					zap.Bool("client_connected", snap.ClientConnected),
+					zap.Int("consumer_count", snap.ConsumerCount),
+				)
+			}
+		}
+	}()
 }
 
 func (s *Service) sendOffer(ps *PeerSession) error {
