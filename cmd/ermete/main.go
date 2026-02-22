@@ -41,6 +41,9 @@ func main() {
 	if err != nil {
 		logger.Fatal("failed to init webrtc", zap.Error(err))
 	}
+	appCtx, stopApp := context.WithCancel(context.Background())
+	defer stopApp()
+	webrtcSvc.StartConnectionLogging(appCtx, 30*time.Second)
 	router := httpapi.NewRouter(cfg, logger, metrics, store, sessions, webrtcSvc)
 
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: router, ReadHeaderTimeout: cfg.ReadHeaderTimeout, ReadTimeout: cfg.ReadTimeout, WriteTimeout: cfg.WriteTimeout, IdleTimeout: cfg.IdleTimeout}
@@ -59,6 +62,7 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	stopApp()
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownGracePeriod)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
