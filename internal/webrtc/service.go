@@ -35,6 +35,14 @@ type CommandEnvelope struct {
 	Bin  string `json:"bin,omitempty"`
 }
 
+var relayedDataMessageTypes = map[string]struct{}{
+	"snapshot_description":   {},
+	"speaker_turn_completed": {},
+	"Snapshot":               {},
+	"PeriodicSnapshot":       {},
+	"say_to_user":            {},
+}
+
 type Service struct {
 	cfg       config.Config
 	logger    *zap.Logger
@@ -382,6 +390,9 @@ func (s *Service) handleCommand(ps *PeerSession, msg pion.DataChannelMessage) {
 		_ = ps.sendCmd(CommandEnvelope{Type: "pong", Bin: base64.StdEncoding.EncodeToString(msg.Data)})
 		return
 	}
+	if s.relayDataMessage(ps, msg.Data) {
+		return
+	}
 	var env CommandEnvelope
 	if err := json.Unmarshal(msg.Data, &env); err != nil {
 		_ = ps.sendCmd(CommandEnvelope{Type: "error", Text: "invalid command envelope"})
@@ -403,6 +414,36 @@ func (s *Service) handleCommand(ps *PeerSession, msg pion.DataChannelMessage) {
 	}
 }
 
+func (s *Service) relayDataMessage(src *PeerSession, data []byte) bool {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	typ, _ := raw["type"].(string)
+	if _, ok := relayedDataMessageTypes[typ]; !ok {
+		return false
+	}
+
+	s.mu.RLock()
+	client := s.client
+	consumers := make([]*PeerSession, 0, len(s.consumers))
+	for _, c := range s.consumers {
+		consumers = append(consumers, c)
+	}
+	s.mu.RUnlock()
+
+	if client != nil && client.id != src.id {
+		_ = client.sendRawDataText(string(data))
+	}
+	for _, c := range consumers {
+		if c == nil || c.id == src.id {
+			continue
+		}
+		_ = c.sendRawDataText(string(data))
+	}
+	return true
+}
+
 func (s *Service) iceServers() []pion.ICEServer {
 	out := make([]pion.ICEServer, 0, 2)
 	if len(s.cfg.WebRTCStunURLs) > 0 {
@@ -422,6 +463,13 @@ func (p *PeerSession) sendCmd(msg CommandEnvelope) error {
 	}
 	b, _ := json.Marshal(msg)
 	return p.cmdChannel.SendText(string(b))
+}
+
+func (p *PeerSession) sendRawDataText(payload string) error {
+	if p.cmdChannel == nil {
+		return nil
+	}
+	return p.cmdChannel.SendText(payload)
 }
 
 func writeJSON(conn *websocket.Conn, v any) error {

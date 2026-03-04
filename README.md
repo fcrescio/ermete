@@ -212,6 +212,14 @@ Comandi:
 - `server_status` -> ritorna stato sessione, ultimo frame, count frames, uptime
 - `say` -> placeholder: conferma modalità loopback audio attiva
 
+Messaggi applicativi inoltrati trasparentemente a tutti gli altri peer connessi (client + consumer, escluso il mittente):
+
+- `snapshot_description`
+- `speaker_turn_completed`
+- `Snapshot`
+- `PeriodicSnapshot`
+- `say_to_user`
+
 Se arriva payload binario non-string, il server risponde con `pong` e `bin` base64.
 
 ## Upload frame
