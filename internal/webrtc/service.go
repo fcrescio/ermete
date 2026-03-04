@@ -212,18 +212,61 @@ func (s *Service) initPeer(ps *PeerSession) error {
 	})
 	pc.OnDataChannel(func(dc *pion.DataChannel) {
 		if dc.Label() != "cmd" {
+			ps.logger.Debug("ignoring datachannel with unexpected label", zap.String("label", dc.Label()))
 			return
 		}
-		ps.cmdChannel = dc
-		dc.OnMessage(func(msg pion.DataChannelMessage) {
-			s.handleCommand(ps, msg)
-		})
+		s.bindCommandChannel(ps, dc, "remote")
 	})
-	_, err = pc.CreateDataChannel("cmd", nil)
+	cmdDC, err := pc.CreateDataChannel("cmd", nil)
 	if err != nil {
 		ps.logger.Warn("server cmd channel create failed", zap.Error(err))
+	} else {
+		s.bindCommandChannel(ps, cmdDC, "local")
 	}
 	return nil
+}
+
+func (s *Service) bindCommandChannel(ps *PeerSession, dc *pion.DataChannel, origin string) {
+	ps.cmdChannel = dc
+	ps.logger.Info("cmd datachannel bound",
+		zap.String("peer_id", ps.id),
+		zap.String("role", ps.role),
+		zap.String("origin", origin),
+		zap.String("label", dc.Label()),
+	)
+	dc.OnOpen(func() {
+		ps.logger.Info("cmd datachannel open",
+			zap.String("peer_id", ps.id),
+			zap.String("role", ps.role),
+			zap.String("origin", origin),
+			zap.String("label", dc.Label()),
+			zap.String("state", dc.ReadyState().String()),
+		)
+		if err := ps.sendCmd(CommandEnvelope{Type: "server_status", Text: "cmd_channel_open"}); err != nil {
+			ps.logger.Warn("failed to send cmd channel open probe", zap.Error(err))
+		}
+	})
+	dc.OnClose(func() {
+		ps.logger.Warn("cmd datachannel closed",
+			zap.String("peer_id", ps.id),
+			zap.String("role", ps.role),
+			zap.String("origin", origin),
+			zap.String("label", dc.Label()),
+			zap.String("state", dc.ReadyState().String()),
+		)
+	})
+	dc.OnError(func(err error) {
+		ps.logger.Error("cmd datachannel error",
+			zap.String("peer_id", ps.id),
+			zap.String("role", ps.role),
+			zap.String("origin", origin),
+			zap.String("label", dc.Label()),
+			zap.Error(err),
+		)
+	})
+	dc.OnMessage(func(msg pion.DataChannelMessage) {
+		s.handleCommand(ps, msg)
+	})
 }
 
 func (s *Service) handleSignal(ps *PeerSession, msg SignalMessage) error {
@@ -459,6 +502,14 @@ func (p *PeerSession) sendSignal(msg SignalMessage) error { return writeJSON(p.c
 
 func (p *PeerSession) sendCmd(msg CommandEnvelope) error {
 	if p.cmdChannel == nil {
+		p.logger.Debug("cmd channel unavailable: message dropped", zap.String("type", msg.Type))
+		return nil
+	}
+	if p.cmdChannel.ReadyState() != pion.DataChannelStateOpen {
+		p.logger.Debug("cmd channel not open yet: message dropped",
+			zap.String("type", msg.Type),
+			zap.String("state", p.cmdChannel.ReadyState().String()),
+		)
 		return nil
 	}
 	b, _ := json.Marshal(msg)
