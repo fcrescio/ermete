@@ -36,6 +36,7 @@ Ermete è un server Go **single-session** per Android che combina signaling WebR
 | `WEBRTC_STUN_URLS` | vuoto | CSV STUN URLs |
 | `WEBRTC_TURN_URLS` | vuoto | CSV TURN URLs |
 | `WEBRTC_TURN_USER` / `WEBRTC_TURN_PASS` | vuoto | credenziali TURN |
+| `CMD_CHANNEL_LOG_ENABLED` | `true` | abilita/disabilita logging messaggi sul DataChannel `cmd` (debug) |
 | `ERMETE_PSK` | *(obbligatoria)* | pre-shared key per `/v1/frames` e `/v1/ws` |
 | `ERMETE_ALLOW_NO_PSK` | `false` | se `true` consente avvio senza PSK (solo dev/test) |
 | `ERMETE_PSK_HEADER` | `X-Ermete-PSK` | header usato per autenticazione PSK |
