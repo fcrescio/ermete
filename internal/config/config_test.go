@@ -21,6 +21,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.PSKHeader != "X-Ermete-PSK" {
 		t.Fatalf("unexpected PSK header default: %s", cfg.PSKHeader)
 	}
+	if !cfg.CmdChannelLogEnabled {
+		t.Fatal("expected cmd channel logging enabled by default")
+	}
 }
 
 func TestInvalidSessionPolicy(t *testing.T) {
@@ -57,5 +60,17 @@ func TestPSKRequiredUnlessAllowed(t *testing.T) {
 	t.Setenv("ERMETE_ALLOW_NO_PSK", "true")
 	if _, err := Load(); err != nil {
 		t.Fatalf("unexpected error with allow-no-psk: %v", err)
+	}
+}
+
+func TestCmdChannelLogEnabledEnv(t *testing.T) {
+	t.Setenv("ERMETE_ALLOW_NO_PSK", "true")
+	t.Setenv("CMD_CHANNEL_LOG_ENABLED", "false")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.CmdChannelLogEnabled {
+		t.Fatal("expected cmd channel logging to be disabled")
 	}
 }

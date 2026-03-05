@@ -16,62 +16,64 @@ const (
 )
 
 type Config struct {
-	HTTPAddr            string
-	DataDir             string
-	MaxUploadMB         int64
-	PSK                 string
-	PSKHeader           string
-	AllowNoPSK          bool
-	PSKAllowQuery       bool
-	CORSAllowedOrigins  []string
-	WSAllowedOrigins    []string
-	WSAllowNoOrigin     bool
-	WSAllowAnyOrigin    bool
-	SessionPolicy       SessionPolicy
-	LogLevel            string
-	TLSCertFile         string
-	TLSKeyFile          string
-	WebRTCStunURLs      []string
-	WebRTCTurnURLs      []string
-	WebRTCTurnUser      string
-	WebRTCTurnPass      string
-	ReadHeaderTimeout   time.Duration
-	WriteTimeout        time.Duration
-	ReadTimeout         time.Duration
-	IdleTimeout         time.Duration
-	ShutdownGracePeriod time.Duration
-	UploadRatePerSec    float64
-	UploadRateBurst     int
-	WSRatePerSec        float64
-	WSRateBurst         int
-	RateLimitMaxEntries int
-	RateLimitTTL        time.Duration
-	IdempotencyTTL      time.Duration
-	IdempotencyMax      int
+	HTTPAddr             string
+	DataDir              string
+	MaxUploadMB          int64
+	PSK                  string
+	PSKHeader            string
+	AllowNoPSK           bool
+	PSKAllowQuery        bool
+	CORSAllowedOrigins   []string
+	WSAllowedOrigins     []string
+	WSAllowNoOrigin      bool
+	WSAllowAnyOrigin     bool
+	SessionPolicy        SessionPolicy
+	LogLevel             string
+	TLSCertFile          string
+	TLSKeyFile           string
+	WebRTCStunURLs       []string
+	WebRTCTurnURLs       []string
+	WebRTCTurnUser       string
+	WebRTCTurnPass       string
+	CmdChannelLogEnabled bool
+	ReadHeaderTimeout    time.Duration
+	WriteTimeout         time.Duration
+	ReadTimeout          time.Duration
+	IdleTimeout          time.Duration
+	ShutdownGracePeriod  time.Duration
+	UploadRatePerSec     float64
+	UploadRateBurst      int
+	WSRatePerSec         float64
+	WSRateBurst          int
+	RateLimitMaxEntries  int
+	RateLimitTTL         time.Duration
+	IdempotencyTTL       time.Duration
+	IdempotencyMax       int
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		HTTPAddr:            getEnv("HTTP_ADDR", ":8080"),
-		DataDir:             getEnv("DATA_DIR", "/data"),
-		LogLevel:            strings.ToLower(getEnv("LOG_LEVEL", "info")),
-		TLSCertFile:         os.Getenv("TLS_CERT_FILE"),
-		TLSKeyFile:          os.Getenv("TLS_KEY_FILE"),
-		ReadHeaderTimeout:   10 * time.Second,
-		WriteTimeout:        30 * time.Second,
-		ReadTimeout:         30 * time.Second,
-		IdleTimeout:         120 * time.Second,
-		ShutdownGracePeriod: 15 * time.Second,
-		UploadRatePerSec:    2,
-		UploadRateBurst:     5,
-		WSRatePerSec:        1,
-		WSRateBurst:         2,
-		PSKHeader:           getEnv("ERMETE_PSK_HEADER", "X-Ermete-PSK"),
-		WSAllowNoOrigin:     true,
-		RateLimitMaxEntries: 10000,
-		RateLimitTTL:        30 * time.Minute,
-		IdempotencyTTL:      10 * time.Minute,
-		IdempotencyMax:      50000,
+		HTTPAddr:             getEnv("HTTP_ADDR", ":8080"),
+		DataDir:              getEnv("DATA_DIR", "/data"),
+		LogLevel:             strings.ToLower(getEnv("LOG_LEVEL", "info")),
+		TLSCertFile:          os.Getenv("TLS_CERT_FILE"),
+		TLSKeyFile:           os.Getenv("TLS_KEY_FILE"),
+		ReadHeaderTimeout:    10 * time.Second,
+		WriteTimeout:         30 * time.Second,
+		ReadTimeout:          30 * time.Second,
+		IdleTimeout:          120 * time.Second,
+		ShutdownGracePeriod:  15 * time.Second,
+		UploadRatePerSec:     2,
+		UploadRateBurst:      5,
+		WSRatePerSec:         1,
+		WSRateBurst:          2,
+		CmdChannelLogEnabled: true,
+		PSKHeader:            getEnv("ERMETE_PSK_HEADER", "X-Ermete-PSK"),
+		WSAllowNoOrigin:      true,
+		RateLimitMaxEntries:  10000,
+		RateLimitTTL:         30 * time.Minute,
+		IdempotencyTTL:       10 * time.Minute,
+		IdempotencyMax:       50000,
 	}
 
 	cfg.PSK = os.Getenv("ERMETE_PSK")
@@ -114,6 +116,7 @@ func Load() (Config, error) {
 	cfg.WebRTCTurnURLs = splitCSV(os.Getenv("WEBRTC_TURN_URLS"))
 	cfg.WebRTCTurnUser = os.Getenv("WEBRTC_TURN_USER")
 	cfg.WebRTCTurnPass = os.Getenv("WEBRTC_TURN_PASS")
+	cfg.CmdChannelLogEnabled = parseBoolEnv("CMD_CHANNEL_LOG_ENABLED", true)
 
 	if v, err := parseIntEnv("RATE_LIMIT_MAX_ENTRIES", cfg.RateLimitMaxEntries); err != nil {
 		return Config{}, err

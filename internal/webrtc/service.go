@@ -269,6 +269,31 @@ func (s *Service) bindCommandChannel(ps *PeerSession, dc *pion.DataChannel, orig
 	})
 }
 
+func (s *Service) logCmdMessage(ps *PeerSession, direction string, msgType string, payload string, isBinary bool) {
+	if !s.cfg.CmdChannelLogEnabled {
+		return
+	}
+	if isBinary {
+		s.logger.Info("cmd message",
+			zap.String("peer_id", ps.id),
+			zap.String("role", ps.role),
+			zap.String("direction", direction),
+			zap.String("message_type", msgType),
+			zap.Bool("binary", true),
+			zap.Int("payload_bytes", len(payload)),
+		)
+		return
+	}
+	s.logger.Info("cmd message",
+		zap.String("peer_id", ps.id),
+		zap.String("role", ps.role),
+		zap.String("direction", direction),
+		zap.String("message_type", msgType),
+		zap.Bool("binary", false),
+		zap.String("payload", payload),
+	)
+}
+
 func (s *Service) handleSignal(ps *PeerSession, msg SignalMessage) error {
 	switch msg.Type {
 	case "offer":
@@ -430,9 +455,12 @@ func (s *Service) NotifyFrameAvailable(meta storage.FrameMeta, publicBaseURL str
 
 func (s *Service) handleCommand(ps *PeerSession, msg pion.DataChannelMessage) {
 	if !msg.IsString {
-		_ = ps.sendCmd(CommandEnvelope{Type: "pong", Bin: base64.StdEncoding.EncodeToString(msg.Data)})
+		binPayload := base64.StdEncoding.EncodeToString(msg.Data)
+		s.logCmdMessage(ps, "inbound", "binary", binPayload, true)
+		_ = ps.sendCmd(CommandEnvelope{Type: "pong", Bin: binPayload})
 		return
 	}
+	s.logCmdMessage(ps, "inbound", "raw", string(msg.Data), false)
 	if s.relayDataMessage(ps, msg.Data) {
 		return
 	}
@@ -441,6 +469,7 @@ func (s *Service) handleCommand(ps *PeerSession, msg pion.DataChannelMessage) {
 		_ = ps.sendCmd(CommandEnvelope{Type: "error", Text: "invalid command envelope"})
 		return
 	}
+	s.logCmdMessage(ps, "inbound", env.Type, string(msg.Data), false)
 	switch env.Type {
 	case "ping":
 		_ = ps.sendCmd(CommandEnvelope{Type: "pong", Text: "ok"})
@@ -513,6 +542,7 @@ func (p *PeerSession) sendCmd(msg CommandEnvelope) error {
 		return nil
 	}
 	b, _ := json.Marshal(msg)
+	p.svc.logCmdMessage(p, "outbound", msg.Type, string(b), false)
 	return p.cmdChannel.SendText(string(b))
 }
 
@@ -520,6 +550,7 @@ func (p *PeerSession) sendRawDataText(payload string) error {
 	if p.cmdChannel == nil {
 		return nil
 	}
+	p.svc.logCmdMessage(p, "outbound", "raw", payload, false)
 	return p.cmdChannel.SendText(payload)
 }
 
